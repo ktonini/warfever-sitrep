@@ -17,20 +17,24 @@ Extract live alliance data directly from The Last War game memory as you play. N
 The game stores alliance data in memory in a specific pattern:
 
 ```
-[ABBR] [32-char-hash] [number] [FULL_NAME]
+[ABBR] [32-char-hash] [START_DELIM] [FULL_NAME] [END_DELIM]
 ```
 
 Example from memory:
 ```
 UvvU 37ecf329739c4b61bf9da597829fa993 2veni vidi vici8
+     ^abbr                             ^hash                ^start ^name        ^end
 ```
+
+The numbers `2` and `8` are delimiters marking the start and end of the name string - they are NOT part of the actual alliance name.
 
 The scanner:
 1. Reads game process memory in real-time
 2. Searches for this pattern using regex
-3. Extracts rank numbers (stored as int32) nearby
-4. Finds power values (stored as uint64) in vicinity
-5. Merges data and exports to CSV
+3. Excludes start/end delimiters from captured name
+4. Extracts rank numbers (stored as int32) nearby
+5. Finds power values (stored as uint64) in vicinity
+6. Merges data and exports to CSV
 
 ## Quick Start
 
@@ -80,14 +84,16 @@ Rank,Short Name,Full Name,Power,Alliance ID
 
 **Alliance Data Structure:**
 ```python
-pattern = rb'([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\x00-\x08\x0b-\x1f]{3,40}?)[\x00-\x08]'
+pattern = rb'([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?'
 ```
 
 Components:
 - `[A-Z][A-Za-z0-9]{1,6}` - Alliance abbreviation (2-7 chars)
 - `[0-9a-f]{32}` - Unique alliance ID (hex hash)
-- `\d` - Number separator
-- `[^\x00-\x08\x0b-\x1f]{3,40}?` - Full name (3-40 printable chars)
+- `\d` - Start delimiter (not captured)
+- `[^\d\x00-\x08\x0b-\x1f]{3,40}?` - Full name (3-40 printable chars, excludes digits)
+- `\d?` - End delimiter (not captured, optional)
+- `[\x00-\x08\x0b-\x1f]?` - Control character terminator (optional)
 
 ### Data Type Storage
 

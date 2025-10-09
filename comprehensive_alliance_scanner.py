@@ -77,9 +77,10 @@ def scan_memory(proc):
             if kernel32.ReadProcessMemory(h_process, ctypes.c_void_p(address), buffer, scan_size, ctypes.byref(bytes_read)):
                 data = bytes(buffer[:bytes_read.value])
 
-                # Pattern 1: ABBR HASH NUMBER FULLNAME
-                # Example: GMUvvU 37ecf329739c4b61bf9da597829fa993 2veni vidi vici8
-                pattern1 = rb'.{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^8\x00]{3,40}?)8'
+                # Pattern: ABBR HASH START_DELIM FULLNAME END_DELIM
+                # Example: UvvU 37ecf329739c4b61bf9da597829fa993 2veni vidi vici8
+                # Start delimiter (2) and end delimiter (8) are not part of the name
+                pattern1 = rb'.{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?'
                 matches = re.findall(pattern1, data)
 
                 for abbr, alliance_id, full_name in matches:
