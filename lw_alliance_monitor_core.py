@@ -6,6 +6,7 @@ Shared alliance memory-scan logic for CLI and GUI (Windows only).
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 import struct
 import time
@@ -105,13 +106,24 @@ def _base_page_protect(protect: int) -> int:
 
 
 def _is_readable_committed_region(protect: int) -> bool:
-    """Committed pages that may hold UI strings (match comprehensive scanner, + writecopy)."""
+    """Committed pages that may hold UI strings (heap, mapped file, IL2CPP .rdata)."""
     base = _base_page_protect(protect)
-    return base in (
+    allowed = {
         0x02,  # PAGE_READONLY
         0x04,  # PAGE_READWRITE
         0x08,  # PAGE_WRITECOPY
-    )
+    }
+    # Unity/IL2CPP literals often live in PAGE_EXECUTE_READ; skip to speed scans: LW_SCAN_SKIP_EXECREAD=1
+    if os.environ.get("LW_SCAN_SKIP_EXECREAD", "").strip() not in ("1", "true", "yes"):
+        allowed.add(0x20)  # PAGE_EXECUTE_READ
+    if os.environ.get("LW_SCAN_RWX", "").strip() in ("1", "true", "yes"):
+        allowed.update(
+            {
+                0x40,  # PAGE_EXECUTE_READWRITE
+                0x80,  # PAGE_EXECUTE_WRITECOPY
+            }
+        )
+    return base in allowed
 
 
 def _rpm_read_chunk(
@@ -202,18 +214,18 @@ def quick_scan(
     # In-memory rows often look like: GMUvvU 37ecf329... 2veni vidi vici8
     # (0–3 prefix bytes before tag; name may end with control or trailing '8').
     ALLIANCE_PATTERNS = (
-        rb".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
-        rb".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^8\x00]{3,50}?)8",
-        rb"([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
-        rb".{0,3}([A-Za-z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+        rb".{0,3}([A-Z][A-Za-z0-9]{1,10})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{2,62}?)\d?[\x00-\x08\x0b-\x1f]?",
+        rb".{0,3}([A-Z][A-Za-z0-9]{1,10})\s+([0-9a-fA-F]{32})\s+\d([^8\x00]{2,62}?)8",
+        rb"([A-Z][A-Za-z0-9]{1,10})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{2,62}?)\d?[\x00-\x08\x0b-\x1f]?",
+        rb".{0,3}([A-Za-z][A-Za-z0-9]{1,10})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{2,62}?)\d?[\x00-\x08\x0b-\x1f]?",
     )
 
     # Unity / IL2CPP often stores UI strings as UTF-16LE; same logical layout as ASCII patterns.
     ALLIANCE_PATTERNS_U = (
-        r".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
-        r".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^8\x00]{3,50}?)8",
-        r"([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
-        r".{0,3}([A-Za-z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+        r".{0,3}([A-Z][A-Za-z0-9]{1,10})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{2,62}?)\d?[\x00-\x08\x0b-\x1f]?",
+        r".{0,3}([A-Z][A-Za-z0-9]{1,10})\s+([0-9a-fA-F]{32})\s+\d([^8\x00]{2,62}?)8",
+        r"([A-Z][A-Za-z0-9]{1,10})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{2,62}?)\d?[\x00-\x08\x0b-\x1f]?",
+        r".{0,3}([A-Za-z][A-Za-z0-9]{1,10})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{2,62}?)\d?[\x00-\x08\x0b-\x1f]?",
     )
 
     def _likely_utf16le_text_blob(blob: bytes) -> bool:
@@ -226,7 +238,7 @@ def quick_scan(
             lo, hi = blob[i], blob[i + 1]
             if hi == 0 and 32 <= lo <= 126:
                 hits += 1
-        return hits >= 12
+        return hits >= 8
 
     chunk_max = 2 * 1024 * 1024
     chunk_overlap = 16384
@@ -239,6 +251,7 @@ def quick_scan(
     rpm_fail = 0
     rpm_chunks_empty = 0
     rpm_paged_recoveries = 0
+    bytes_scanned = 0
     raw_byte_hits = 0
     utf16_raw_hits = 0
 
@@ -249,7 +262,7 @@ def quick_scan(
         alliance_id_str: str,
         full_name_str: str,
     ) -> None:
-        if not (3 < len(full_name_str) < 50 and len(abbr_str) <= 10):
+        if not (2 < len(full_name_str) < 64 and len(abbr_str) <= 12):
             return
         alliance_id_str = alliance_id_str.lower()
         if len(alliance_id_str) != 32 or not re.fullmatch(r"[0-9a-f]+", alliance_id_str):
@@ -351,6 +364,7 @@ def quick_scan(
                 data, used_paged = _rpm_read_chunk(kernel32, h_process, read_addr, read_len)
                 if data:
                     rpm_ok += 1
+                    bytes_scanned += len(data)
                     if used_paged:
                         rpm_paged_recoveries += 1
                     scan_buffer(data)
@@ -376,16 +390,18 @@ def quick_scan(
     elapsed = time.perf_counter() - t0
     accepted = len(found_data)
     pattern_hits = raw_byte_hits + utf16_raw_hits
+    scanned_mib = bytes_scanned / (1024 * 1024)
     _log.info(
         "quick_scan %sin %.2fs: VirtualQuery ok=%s fail=%s readable_regions=%s "
-        "chunks=%s rpm_ok=%s rpm_fail=%s rpm_empty_chunks=%s rpm_paged_recover=%s "
-        "raw_ascii_hits=%s utf16_hits=%s accepted_alliances=%s",
+        "chunks=%s bytes_scanned_mib=%.1f rpm_ok=%s rpm_fail=%s rpm_empty_chunks=%s "
+        "rpm_paged_recover=%s raw_ascii_hits=%s utf16_hits=%s accepted_alliances=%s",
         "aborted " if aborted else "done ",
         elapsed,
         vq_ok,
         vq_fail,
         readable_regions,
         chunks_read,
+        scanned_mib,
         rpm_ok,
         rpm_fail,
         rpm_chunks_empty,
@@ -396,8 +412,11 @@ def quick_scan(
     )
     if accepted == 0 and pattern_hits == 0:
         _log.warning(
-            "No regex matches (ASCII or UTF-16) — rankings layout may have changed, "
-            "strings may be encrypted until render, or rankings UI is not in memory."
+            "No regex matches (ASCII or UTF-16). Causes may include rankings closed, new wire "
+            "format, or GPU-only text. Scanned ~%.1f MiB this pass. "
+            "Tuning: LW_SCAN_SKIP_EXECREAD=1 skips PAGE_EXECUTE_READ (faster). "
+            "LW_SCAN_RWX=1 also scans RWX (much slower).",
+            scanned_mib,
         )
     elif accepted == 0 and pattern_hits > 0:
         _log.warning(
