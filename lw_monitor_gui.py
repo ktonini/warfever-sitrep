@@ -7,7 +7,23 @@ Build: see scripts/build_windows_gui.ps1
 
 from __future__ import annotations
 
+import os
 import sys
+
+
+def _clear_stale_tcl_tk_env() -> None:
+    """Drop TCL_LIBRARY/TK_LIBRARY that point at dead paths (common after PyInstaller runs)."""
+    for key in ("TCL_LIBRARY", "TK_LIBRARY"):
+        path = os.environ.get(key)
+        if not path:
+            continue
+        normalized = path.replace("/", os.sep)
+        if "_MEI" in normalized or not os.path.isdir(normalized):
+            del os.environ[key]
+
+
+_clear_stale_tcl_tk_env()
+
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -297,7 +313,23 @@ class AllianceMonitorApp(tk.Tk):
 
 
 def main() -> None:
-    app = AllianceMonitorApp()
+    try:
+        app = AllianceMonitorApp()
+    except tk.TclError as e:
+        err = str(e).lower()
+        if "init.tcl" in err:
+            print(
+                "Tkinter could not load Tcl/Tk.\n\n"
+                "If TCL_LIBRARY or TK_LIBRARY is set (often after running a PyInstaller .exe), "
+                "clear them for this shell, then retry:\n"
+                "  set TCL_LIBRARY=\n"
+                "  set TK_LIBRARY=\n\n"
+                "If it still fails, use the full installer from https://www.python.org/downloads/ "
+                "(Windows Store / embed builds sometimes omit Tk).\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
     app.mainloop()
 
 
