@@ -119,49 +119,54 @@ def _rpm_read_chunk(
 ) -> tuple[bytes, bool]:
     """
     Read up to read_len bytes. Returns (data, used_paged_fallback).
-    Large reads often fail with ERROR_PARTIAL_COPY (299); 4 KiB stepping recovers most data.
+
+    On failure, ReadProcessMemory can still set NumberOfBytesRead (e.g. ERROR_PARTIAL_COPY
+    299) — we must use those bytes, then read the remainder in smaller steps.
     """
     if read_len <= 0:
         return b"", False
     buf = (ctypes.c_char * read_len)()
-    br = ctypes.c_size_t()
-    ok = kernel32.ReadProcessMemory(
-        h_process,
-        ctypes.c_void_p(read_addr),
-        buf,
-        read_len,
-        ctypes.byref(br),
+    br = ctypes.c_size_t(0)
+    ok = bool(
+        kernel32.ReadProcessMemory(
+            h_process,
+            ctypes.c_void_p(read_addr),
+            buf,
+            read_len,
+            ctypes.byref(br),
+        )
     )
-    if ok and int(br.value) == read_len:
-        return bytes(buf[:read_len]), False
+    got0 = int(br.value)
+    if ok and got0 == read_len:
+        return bytes(memoryview(buf)[:read_len]), False
 
-    err = kernel32.GetLastError()
-    page = 4096
     out = bytearray()
-    pos = 0
+    if got0 > 0:
+        out.extend(memoryview(buf)[:got0])
+
+    # First call did not return the full buffer; finish with page-sized reads.
+    used_fallback = not (ok and got0 == read_len)
+    page = 4096
+    pos = got0
     while pos < read_len:
         chunk = min(page, read_len - pos)
         b2 = (ctypes.c_char * chunk)()
-        br2 = ctypes.c_size_t()
-        if kernel32.ReadProcessMemory(
+        br2 = ctypes.c_size_t(0)
+        kernel32.ReadProcessMemory(
             h_process,
             ctypes.c_void_p(read_addr + pos),
             b2,
             chunk,
             ctypes.byref(br2),
-        ):
-            got = int(br2.value)
-            if got > 0:
-                out.extend(b2[:got])
-        pos += chunk
-    if not out:
-        _log.debug(
-            "RPM chunk empty after paged read addr=0x%x len=%s first_err=%s",
-            read_addr,
-            read_len,
-            err,
         )
-    return bytes(out), True
+        got = int(br2.value)
+        if got > 0:
+            out.extend(memoryview(b2)[:got])
+            pos += got
+        else:
+            pos += chunk
+
+    return bytes(out), used_fallback
 
 
 def quick_scan(
@@ -232,6 +237,7 @@ def quick_scan(
     chunks_read = 0
     rpm_ok = 0
     rpm_fail = 0
+    rpm_chunks_empty = 0
     rpm_paged_recoveries = 0
     raw_byte_hits = 0
     utf16_raw_hits = 0
@@ -352,6 +358,7 @@ def quick_scan(
                         scan_buffer_utf16(data)
                 else:
                     rpm_fail += 1
+                    rpm_chunks_empty += 1
 
                 if read_len < chunk_max:
                     offset += read_len
@@ -371,7 +378,7 @@ def quick_scan(
     pattern_hits = raw_byte_hits + utf16_raw_hits
     _log.info(
         "quick_scan %sin %.2fs: VirtualQuery ok=%s fail=%s readable_regions=%s "
-        "chunks=%s rpm_ok=%s rpm_fail=%s rpm_paged_recover=%s "
+        "chunks=%s rpm_ok=%s rpm_fail=%s rpm_empty_chunks=%s rpm_paged_recover=%s "
         "raw_ascii_hits=%s utf16_hits=%s accepted_alliances=%s",
         "aborted " if aborted else "done ",
         elapsed,
@@ -381,6 +388,7 @@ def quick_scan(
         chunks_read,
         rpm_ok,
         rpm_fail,
+        rpm_chunks_empty,
         rpm_paged_recoveries,
         raw_byte_hits,
         utf16_raw_hits,
