@@ -262,6 +262,13 @@ def quick_scan(
     raw_byte_hits = 0
     utf16_raw_hits = 0
 
+    # Optional: set LW_DEBUG_FIND=YourTag to count chunks containing that UTF-8 / UTF-16-LE needle
+    debug_find = os.environ.get("LW_DEBUG_FIND", "").strip()[:48]
+    debug_find_chunks = 0
+    debug_find_utf16_chunks = 0
+    debug_find_b = debug_find.encode("utf-8", errors="ignore") if debug_find else b""
+    debug_find_u16 = debug_find.encode("utf-16-le", errors="ignore") if debug_find else b""
+
     def _store_row(
         blob: bytes,
         anchor: bytes,
@@ -392,6 +399,10 @@ def quick_scan(
                     bytes_scanned += len(data)
                     if used_paged:
                         rpm_paged_recoveries += 1
+                    if debug_find and debug_find_b in data:
+                        debug_find_chunks += 1
+                    if debug_find and debug_find_u16 in data:
+                        debug_find_utf16_chunks += 1
                     scan_buffer(data)
                     if _likely_utf16le_text_blob(data):
                         scan_buffer_utf16(data)
@@ -432,16 +443,26 @@ def quick_scan(
         rpm_chunks_empty,
         rpm_paged_recoveries,
         raw_byte_hits,
-            utf16_raw_hits,
-            accepted,
+        utf16_raw_hits,
+        accepted,
     )
     flush_monitor_log()
+    if debug_find:
+        _log.info(
+            "LW_DEBUG_FIND=%r: chunks_with_utf8_needle=%s chunks_with_utf16le_needle=%s "
+            "(set tag while rankings list is on screen; 0 means string not in scanned memory)",
+            debug_find,
+            debug_find_chunks,
+            debug_find_utf16_chunks,
+        )
+        flush_monitor_log()
     if accepted == 0 and pattern_hits == 0:
         _log.warning(
             "No regex matches (ASCII or UTF-16). Causes may include rankings closed, new wire "
             "format, or GPU-only text. Scanned ~%.1f MiB this pass. "
             "Tuning: LW_SCAN_SKIP_EXECREAD=1 skips PAGE_EXECUTE_READ (faster). "
-            "LW_SCAN_RWX=1 also scans RWX (much slower).",
+            "LW_SCAN_RWX=1 also scans RWX (much slower). "
+            "Debug: set env LW_DEBUG_FIND=YourAllianceTag while the tag is visible on screen.",
             scanned_mib,
         )
     elif accepted == 0 and pattern_hits > 0:
