@@ -45,7 +45,7 @@ from lw_alliance_monitor_core import (
     run_monitor_loop,
     write_alliance_csv,
 )
-from lw_debug_log import get_logger, setup_monitor_logging
+from lw_debug_log import flush_monitor_log, get_logger, setup_monitor_logging
 
 
 def application_base_dir() -> Path:
@@ -358,16 +358,30 @@ class AllianceMonitorApp(tk.Tk):
         h_proc, k32 = opened
 
         self._set_scan_once_busy(True)
-        self._status_var.set("Scan once running in background (UI should stay responsive)…")
+        self._status_var.set(
+            "Scan once running in background. First log lines appear immediately; "
+            "then progress every ~15s in lw_monitor_debug.log (full pass can take many minutes)."
+        )
 
         def run_once() -> None:
             err: BaseException | None = None
             new_data: dict[str, Any] = {}
             try:
+                get_logger().info(
+                    "Scan once: calling quick_scan (first log line should be 'quick_scan started'; "
+                    "then progress every ~15s until done)"
+                )
+                flush_monitor_log()
                 new_data = quick_scan(h_proc, k32, lambda: self._shutting_down)
+                get_logger().info(
+                    "Scan once: quick_scan finished with %s alliance keys this pass",
+                    len(new_data),
+                )
+                flush_monitor_log()
             except Exception as e:
                 err = e
                 get_logger().exception("Scan once failed")
+                flush_monitor_log()
             finally:
                 close_handle(k32, h_proc)
 

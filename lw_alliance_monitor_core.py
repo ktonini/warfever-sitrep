@@ -17,7 +17,7 @@ from typing import Any, Callable
 
 import psutil
 
-from lw_debug_log import get_logger
+from lw_debug_log import flush_monitor_log, get_logger
 
 _log = get_logger()
 
@@ -187,11 +187,18 @@ def quick_scan(
     should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     t0 = time.perf_counter()
+    last_progress_log = t0
 
     def _abort_requested() -> bool:
         return should_stop is not None and should_stop()
 
     aborted = False
+    _log.info(
+        "quick_scan started (full address walk; often several minutes — "
+        "progress every ~15s; set LW_SCAN_SKIP_EXECREAD=1 for faster scans)"
+    )
+    flush_monitor_log()
+
     class MEMORY_BASIC_INFORMATION(ctypes.Structure):
         _fields_ = [
             ("BaseAddress", ctypes.c_void_p),
@@ -347,6 +354,24 @@ def quick_scan(
             continue
 
         vq_ok += 1
+        now = time.perf_counter()
+        if now - last_progress_log >= 15.0:
+            last_progress_log = now
+            scanned_so_far = bytes_scanned / (1024 * 1024)
+            _log.info(
+                "quick_scan progress: %.0fs elapsed vq=%s readable_regions=%s chunks=%s "
+                "MiB_scanned=%.1f ascii_hits=%s utf16_hits=%s accepted=%s",
+                now - t0,
+                vq_ok,
+                readable_regions,
+                chunks_read,
+                scanned_so_far,
+                raw_byte_hits,
+                utf16_raw_hits,
+                len(found_data),
+            )
+            flush_monitor_log()
+
         region_base = int(ctypes.cast(mbi.BaseAddress, ctypes.c_void_p).value or 0)
         region_size = int(mbi.RegionSize)
 
@@ -407,9 +432,10 @@ def quick_scan(
         rpm_chunks_empty,
         rpm_paged_recoveries,
         raw_byte_hits,
-        utf16_raw_hits,
-        accepted,
+            utf16_raw_hits,
+            accepted,
     )
+    flush_monitor_log()
     if accepted == 0 and pattern_hits == 0:
         _log.warning(
             "No regex matches (ASCII or UTF-16). Causes may include rankings closed, new wire "

@@ -13,6 +13,15 @@ def get_logger() -> logging.Logger:
     return logging.getLogger(LOGGER_NAME)
 
 
+def flush_monitor_log() -> None:
+    """Push log handlers to disk (safe from worker threads)."""
+    for h in get_logger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+
 def setup_monitor_logging(
     *,
     verbose: bool,
