@@ -135,7 +135,13 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
 
     found_data: dict[str, dict[str, Any]] = {}
 
-    pattern = rb'([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?'
+    # In-memory rows often look like: GMUvvU 37ecf329... 2veni vidi vici8
+    # (0–3 prefix bytes before tag; name may end with control or trailing '8').
+    ALLIANCE_PATTERNS = (
+        rb".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+        rb".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^8\x00]{3,50}?)8",
+        rb"([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+    )
 
     chunk_max = 2 * 1024 * 1024
     chunk_overlap = 16384
@@ -150,48 +156,49 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
 
     def scan_buffer(data: bytes) -> None:
         nonlocal raw_pattern_hits
-        matches = re.findall(pattern, data)
-        raw_pattern_hits += len(matches)
-        for abbr, alliance_id, full_name in matches:
-            try:
-                abbr_str = abbr.decode("utf-8", errors="ignore").strip()
-                alliance_id_str = alliance_id.decode("utf-8")
-                full_name_str = full_name.decode("utf-8", errors="ignore").strip()
-                full_name_str = "".join(
-                    c for c in full_name_str if c.isprintable() or c.isspace()
-                )
-                full_name_str = " ".join(full_name_str.split())
+        for pat in ALLIANCE_PATTERNS:
+            matches = re.findall(pat, data)
+            raw_pattern_hits += len(matches)
+            for abbr, alliance_id, full_name in matches:
+                try:
+                    abbr_str = abbr.decode("utf-8", errors="ignore").strip()
+                    alliance_id_str = alliance_id.decode("utf-8")
+                    full_name_str = full_name.decode("utf-8", errors="ignore").strip()
+                    full_name_str = "".join(
+                        c for c in full_name_str if c.isprintable() or c.isspace()
+                    )
+                    full_name_str = " ".join(full_name_str.split())
 
-                if 3 < len(full_name_str) < 50 and len(abbr_str) <= 10:
-                    abbr_idx = data.find(abbr)
-                    rank = None
-                    power = None
+                    if 3 < len(full_name_str) < 50 and len(abbr_str) <= 10:
+                        abbr_idx = data.find(abbr)
+                        rank = None
+                        power = None
 
-                    if abbr_idx != -1:
-                        check_start = max(0, abbr_idx - 100)
-                        check_end = min(len(data), abbr_idx + 200)
-                        check_region = data[check_start:check_end]
+                        if abbr_idx != -1:
+                            check_start = max(0, abbr_idx - 100)
+                            check_end = min(len(data), abbr_idx + 200)
+                            check_region = data[check_start:check_end]
 
-                        for r in range(1, 51):
-                            if struct.pack("<I", r) in check_region:
-                                rank = r
-                                break
+                            for r in range(1, 51):
+                                if struct.pack("<I", r) in check_region:
+                                    rank = r
+                                    break
 
-                        for i in range(0, len(check_region) - 8, 4):
-                            val = struct.unpack("<Q", check_region[i : i + 8])[0]
-                            if 1_000_000_000 <= val <= 10_000_000_000:
-                                power = val
-                                break
+                            for i in range(0, len(check_region) - 8, 4):
+                                val = struct.unpack("<Q", check_region[i : i + 8])[0]
+                                if 1_000_000_000 <= val <= 10_000_000_000:
+                                    power = val
+                                    break
 
-                    found_data[alliance_id_str] = {
-                        "abbr": abbr_str,
-                        "name": full_name_str,
-                        "id": alliance_id_str,
-                        "rank": rank,
-                        "power": power,
-                    }
-            except (UnicodeDecodeError, struct.error, IndexError):
-                continue
+                        found_data[alliance_id_str] = {
+                            "abbr": abbr_str,
+                            "name": full_name_str,
+                            "id": alliance_id_str,
+                            "rank": rank,
+                            "power": power,
+                        }
+                except (UnicodeDecodeError, struct.error, IndexError):
+                    continue
 
     while address < max_address:
         if kernel32.VirtualQueryEx(
