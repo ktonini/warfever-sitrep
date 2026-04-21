@@ -18,15 +18,34 @@ import psutil
 
 
 def find_process(name_pattern: str) -> psutil.Process | None:
+    """Pick the main game process if several names match (e.g. launcher vs client)."""
     needle = name_pattern.lower()
+    candidates: list[psutil.Process] = []
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             name = proc.info.get("name") or ""
             if needle in name.lower():
-                return proc
+                candidates.append(proc)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return None
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def score(proc: psutil.Process) -> int:
+        try:
+            exe = (proc.exe() or "").lower()
+            rss = int(proc.memory_info().rss)
+            if "launcher" in exe or "updater" in exe:
+                rss -= 10**12
+            if exe.endswith("lastwar.exe") and "launcher" not in exe:
+                rss += 10**12
+            return rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return 0
+
+    return max(candidates, key=score)
 
 
 def open_game_handle(pid: int) -> tuple[Any, Any] | None:
@@ -42,6 +61,21 @@ def open_game_handle(pid: int) -> tuple[Any, Any] | None:
 def close_handle(kernel32: Any, h_process: Any) -> None:
     if h_process:
         kernel32.CloseHandle(h_process)
+
+
+def _base_page_protect(protect: int) -> int:
+    """Lower byte of protection (ignore PAGE_GUARD / PAGE_NOCACHE / etc.)."""
+    return int(protect) & 0xFF
+
+
+def _is_readable_committed_region(protect: int) -> bool:
+    """Committed pages that may hold UI strings (match comprehensive scanner, + writecopy)."""
+    base = _base_page_protect(protect)
+    return base in (
+        0x02,  # PAGE_READONLY
+        0x04,  # PAGE_READWRITE
+        0x08,  # PAGE_WRITECOPY
+    )
 
 
 def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
@@ -61,11 +95,56 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
     max_address = 0x7FFFFFFF0000
 
     MEM_COMMIT = 0x1000
-    PAGE_READWRITE = 0x04
 
     found_data: dict[str, dict[str, Any]] = {}
 
     pattern = rb'([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?'
+
+    chunk_max = 2 * 1024 * 1024
+    chunk_overlap = 16384
+
+    def scan_buffer(data: bytes) -> None:
+        matches = re.findall(pattern, data)
+        for abbr, alliance_id, full_name in matches:
+            try:
+                abbr_str = abbr.decode("utf-8", errors="ignore").strip()
+                alliance_id_str = alliance_id.decode("utf-8")
+                full_name_str = full_name.decode("utf-8", errors="ignore").strip()
+                full_name_str = "".join(
+                    c for c in full_name_str if c.isprintable() or c.isspace()
+                )
+                full_name_str = " ".join(full_name_str.split())
+
+                if 3 < len(full_name_str) < 50 and len(abbr_str) <= 10:
+                    abbr_idx = data.find(abbr)
+                    rank = None
+                    power = None
+
+                    if abbr_idx != -1:
+                        check_start = max(0, abbr_idx - 100)
+                        check_end = min(len(data), abbr_idx + 200)
+                        check_region = data[check_start:check_end]
+
+                        for r in range(1, 51):
+                            if struct.pack("<I", r) in check_region:
+                                rank = r
+                                break
+
+                        for i in range(0, len(check_region) - 8, 4):
+                            val = struct.unpack("<Q", check_region[i : i + 8])[0]
+                            if 1_000_000_000 <= val <= 10_000_000_000:
+                                power = val
+                                break
+
+                    found_data[alliance_id_str] = {
+                        "abbr": abbr_str,
+                        "name": full_name_str,
+                        "id": alliance_id_str,
+                        "rank": rank,
+                        "power": power,
+                    }
+            except (UnicodeDecodeError, struct.error, IndexError):
+                continue
 
     while address < max_address:
         if kernel32.VirtualQueryEx(
@@ -74,63 +153,36 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
             address += 0x10000
             continue
 
-        if mbi.State == MEM_COMMIT and mbi.Protect == PAGE_READWRITE:
-            scan_size = min(mbi.RegionSize, 2 * 1024 * 1024)
-            buffer = (ctypes.c_char * scan_size)()
-            bytes_read = ctypes.c_size_t()
+        region_base = int(ctypes.cast(mbi.BaseAddress, ctypes.c_void_p).value or 0)
+        region_size = int(mbi.RegionSize)
 
-            if kernel32.ReadProcessMemory(
-                h_process,
-                ctypes.c_void_p(address),
-                buffer,
-                scan_size,
-                ctypes.byref(bytes_read),
-            ):
-                data = bytes(buffer[: bytes_read.value])
-                matches = re.findall(pattern, data)
+        if mbi.State == MEM_COMMIT and _is_readable_committed_region(mbi.Protect):
+            offset = 0
+            while offset < region_size:
+                read_len = min(chunk_max, region_size - offset)
+                buffer = (ctypes.c_char * read_len)()
+                bytes_read = ctypes.c_size_t()
+                read_addr = region_base + offset
 
-                for abbr, alliance_id, full_name in matches:
-                    try:
-                        abbr_str = abbr.decode("utf-8", errors="ignore").strip()
-                        alliance_id_str = alliance_id.decode("utf-8")
-                        full_name_str = full_name.decode("utf-8", errors="ignore").strip()
-                        full_name_str = "".join(
-                            c for c in full_name_str if c.isprintable() or c.isspace()
-                        )
-                        full_name_str = " ".join(full_name_str.split())
+                if kernel32.ReadProcessMemory(
+                    h_process,
+                    ctypes.c_void_p(read_addr),
+                    buffer,
+                    read_len,
+                    ctypes.byref(bytes_read),
+                ):
+                    data = bytes(buffer[: bytes_read.value])
+                    scan_buffer(data)
 
-                        if 3 < len(full_name_str) < 50 and len(abbr_str) <= 10:
-                            abbr_idx = data.find(abbr)
-                            rank = None
-                            power = None
+                if read_len < chunk_max:
+                    offset += read_len
+                else:
+                    offset += chunk_max - chunk_overlap
 
-                            if abbr_idx != -1:
-                                check_start = max(0, abbr_idx - 100)
-                                check_end = min(len(data), abbr_idx + 200)
-                                check_region = data[check_start:check_end]
-
-                                for r in range(1, 51):
-                                    if struct.pack("<I", r) in check_region:
-                                        rank = r
-                                        break
-
-                                for i in range(0, len(check_region) - 8, 4):
-                                    val = struct.unpack("<Q", check_region[i : i + 8])[0]
-                                    if 1_000_000_000 <= val <= 10_000_000_000:
-                                        power = val
-                                        break
-
-                            found_data[alliance_id_str] = {
-                                "abbr": abbr_str,
-                                "name": full_name_str,
-                                "id": alliance_id_str,
-                                "rank": rank,
-                                "power": power,
-                            }
-                    except (UnicodeDecodeError, struct.error, IndexError):
-                        continue
-
-        address += mbi.RegionSize
+        next_address = region_base + region_size
+        if next_address <= address:
+            next_address = address + 0x1000
+        address = next_address
 
     return found_data
 

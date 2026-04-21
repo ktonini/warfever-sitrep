@@ -178,7 +178,9 @@ class AllianceMonitorApp(tk.Tk):
 
         self._set_running_ui(True)
         self._status_var.set(
-            f"Monitoring {game_proc.name()} (PID {game_proc.pid}). Scroll slowly in rankings."
+            f"Monitoring {game_proc.name()} (PID {game_proc.pid}). "
+            "First full memory pass can take several minutes; then the scan # will increase. "
+            "Keep the rankings list open and scroll slowly."
         )
 
         def worker() -> None:
