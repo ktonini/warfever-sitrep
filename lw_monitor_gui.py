@@ -24,6 +24,7 @@ def _clear_stale_tcl_tk_env() -> None:
 
 _clear_stale_tcl_tk_env()
 
+import logging
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -44,6 +45,7 @@ from lw_alliance_monitor_core import (
     run_monitor_loop,
     write_alliance_csv,
 )
+from lw_debug_log import get_logger, setup_monitor_logging
 
 
 def application_base_dir() -> Path:
@@ -52,12 +54,43 @@ def application_base_dir() -> Path:
     return Path.cwd()
 
 
+class _TkTextLogHandler(logging.Handler):
+    """Thread-safe append to a Tk Text widget (schedules on the Tk main thread)."""
+
+    def __init__(self, widget: tk.Text) -> None:
+        super().__init__()
+        self.widget = widget
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record) + "\n"
+        except Exception:
+            return
+
+        def append() -> None:
+            try:
+                self.widget.configure(state=tk.NORMAL)
+                self.widget.insert(tk.END, msg)
+                end_line = int(float(self.widget.index("end-1c")))
+                if end_line > 500:
+                    self.widget.delete("1.0", "100.0")
+                self.widget.see(tk.END)
+                self.widget.configure(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+
+        try:
+            self.widget.after(0, append)
+        except tk.TclError:
+            pass
+
+
 class AllianceMonitorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Last War — Alliance Memory Monitor")
-        self.minsize(880, 520)
-        self.geometry("960x600")
+        self.minsize(880, 640)
+        self.geometry("960x720")
 
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
@@ -71,6 +104,9 @@ class AllianceMonitorApp(tk.Tk):
         self._finalize_after_id: str | None = None
         self._finalize_lock = threading.Lock()
         self._finalize_done = False
+        self._debug_log_path = application_base_dir() / "lw_monitor_debug.log"
+        self._verbose_var = tk.BooleanVar(value=True)
+        self._tk_log_handler: _TkTextLogHandler | None = None
 
         self._build_ui()
 
@@ -129,7 +165,56 @@ class AllianceMonitorApp(tk.Tk):
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
 
+        log_frame = ttk.LabelFrame(self, text="Debug log", padding=4)
+        log_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 8))
+
+        log_toolbar = ttk.Frame(log_frame)
+        log_toolbar.pack(fill=tk.X)
+        ttk.Checkbutton(
+            log_toolbar,
+            text="Verbose (DEBUG to file + panel)",
+            variable=self._verbose_var,
+            command=self._configure_monitor_logging,
+        ).pack(side=tk.LEFT)
+        ttk.Button(log_toolbar, text="Clear panel", command=self._clear_debug_log).pack(side=tk.LEFT, padx=(8, 0))
+        self._log_path_display = tk.StringVar(value=f"Log file: {self._debug_log_path}")
+        ttk.Label(log_toolbar, textvariable=self._log_path_display, wraplength=560).pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
+
+        self._debug_text = tk.Text(log_frame, height=10, wrap=tk.NONE, font=("Consolas", 9))
+        dbg_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self._debug_text.yview)
+        self._debug_text.configure(yscrollcommand=dbg_scroll.set)
+        self._debug_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dbg_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._tk_log_handler = _TkTextLogHandler(self._debug_text)
+        self._configure_monitor_logging()
+        get_logger().info(
+            "GUI started; log file=%s verbose=%s",
+            self._debug_log_path,
+            self._verbose_var.get(),
+        )
+
         self._poll_ui()
+
+    def _configure_monitor_logging(self) -> None:
+        assert self._tk_log_handler is not None
+        setup_monitor_logging(
+            verbose=bool(self._verbose_var.get()),
+            log_file=self._debug_log_path,
+            gui_handler=self._tk_log_handler,
+        )
+        get_logger().info(
+            "Logging configured verbose=%s file=%s",
+            self._verbose_var.get(),
+            self._debug_log_path,
+        )
+
+    def _clear_debug_log(self) -> None:
+        self._debug_text.configure(state=tk.NORMAL)
+        self._debug_text.delete("1.0", tk.END)
+        self._debug_text.configure(state=tk.DISABLED)
 
     def _browse_output(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -149,6 +234,7 @@ class AllianceMonitorApp(tk.Tk):
 
     def _on_start(self) -> None:
         self._output_path = Path(self._path_var.get()).expanduser()
+        get_logger().info("Start monitoring clicked")
         game_proc = find_process("LastWar")
         if not game_proc:
             messagebox.showerror(
@@ -181,6 +267,11 @@ class AllianceMonitorApp(tk.Tk):
             f"Monitoring {game_proc.name()} (PID {game_proc.pid}). "
             "First full memory pass can take several minutes; then the scan # will increase. "
             "Keep the rankings list open and scroll slowly."
+        )
+        get_logger().info(
+            "Monitoring thread will use pid=%s name=%r",
+            game_proc.pid,
+            game_proc.name(),
         )
 
         def worker() -> None:
@@ -233,6 +324,7 @@ class AllianceMonitorApp(tk.Tk):
 
     def _on_scan_once(self) -> None:
         self._output_path = Path(self._path_var.get()).expanduser()
+        get_logger().info("Scan once clicked")
         game_proc = find_process("LastWar")
         if not game_proc:
             messagebox.showerror("Game not found", "Start the game first.")
@@ -248,6 +340,11 @@ class AllianceMonitorApp(tk.Tk):
             new_data = quick_scan(h, k32)
             with self._alliances_lock:
                 merge_alliances(self._alliances, new_data)
+            get_logger().info(
+                "Scan once finished; new_keys=%s total_alliances=%s",
+                len(new_data),
+                len(self._alliances),
+            )
         finally:
             close_handle(k32, h)
         self._refresh_table()

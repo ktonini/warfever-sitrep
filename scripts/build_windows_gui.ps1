@@ -17,6 +17,7 @@ python -m PyInstaller `
     --windowed `
     --name "LastWarAllianceMonitor" `
     --hidden-import "psutil._psutil_windows" `
+    --hidden-import "lw_debug_log" `
     lw_monitor_gui.py
 
 Write-Host "Done. Output: $root\dist\LastWarAllianceMonitor.exe"

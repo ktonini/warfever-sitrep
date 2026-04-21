@@ -26,6 +26,15 @@ output_file = Path("live_alliance_data.csv")
 
 
 def main() -> None:
+    if "--debug" in sys.argv:
+        from lw_debug_log import setup_monitor_logging
+
+        setup_monitor_logging(
+            verbose=True,
+            log_file=Path.cwd() / "lw_monitor_debug.log",
+            stream=sys.stderr,
+        )
+
     print("Live Alliance Monitor")
     print("=" * 60)
     print("\n[*] Instructions:")

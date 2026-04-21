@@ -16,6 +16,10 @@ from typing import Any, Callable
 
 import psutil
 
+from lw_debug_log import get_logger
+
+_log = get_logger()
+
 
 def find_process(name_pattern: str) -> psutil.Process | None:
     """Pick the main game process if several names match (e.g. launcher vs client)."""
@@ -29,9 +33,26 @@ def find_process(name_pattern: str) -> psutil.Process | None:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     if not candidates:
+        _log.info("find_process(%r): no matching processes", name_pattern)
         return None
+    for p in candidates:
+        try:
+            _log.debug(
+                "find_process candidate pid=%s name=%r exe=%r",
+                p.pid,
+                p.name(),
+                p.exe(),
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
+            _log.debug("find_process candidate pid=%s (exe unavailable: %s)", p.pid, e)
     if len(candidates) == 1:
-        return candidates[0]
+        chosen = candidates[0]
+        _log.info(
+            "find_process: using pid=%s name=%r",
+            chosen.pid,
+            chosen.name(),
+        )
+        return chosen
 
     def score(proc: psutil.Process) -> int:
         try:
@@ -45,7 +66,19 @@ def find_process(name_pattern: str) -> psutil.Process | None:
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             return 0
 
-    return max(candidates, key=score)
+    chosen = max(candidates, key=score)
+    try:
+        exe = chosen.exe()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        exe = "?"
+    _log.info(
+        "find_process: chose pid=%s name=%r exe=%r (from %d candidates)",
+        chosen.pid,
+        chosen.name(),
+        exe,
+        len(candidates),
+    )
+    return chosen
 
 
 def open_game_handle(pid: int) -> tuple[Any, Any] | None:
@@ -54,7 +87,10 @@ def open_game_handle(pid: int) -> tuple[Any, Any] | None:
     PROCESS_QUERY_INFORMATION = 0x0400
     h = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
     if not h:
+        err = kernel32.GetLastError()
+        _log.error("OpenProcess failed pid=%s GetLastError=%s", pid, err)
         return None
+    _log.info("OpenProcess ok pid=%s handle=%s", pid, h)
     return h, kernel32
 
 
@@ -79,6 +115,7 @@ def _is_readable_committed_region(protect: int) -> bool:
 
 
 def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
+    t0 = time.perf_counter()
     class MEMORY_BASIC_INFORMATION(ctypes.Structure):
         _fields_ = [
             ("BaseAddress", ctypes.c_void_p),
@@ -103,8 +140,18 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
     chunk_max = 2 * 1024 * 1024
     chunk_overlap = 16384
 
+    vq_ok = 0
+    vq_fail = 0
+    readable_regions = 0
+    chunks_read = 0
+    rpm_ok = 0
+    rpm_fail = 0
+    raw_pattern_hits = 0
+
     def scan_buffer(data: bytes) -> None:
+        nonlocal raw_pattern_hits
         matches = re.findall(pattern, data)
+        raw_pattern_hits += len(matches)
         for abbr, alliance_id, full_name in matches:
             try:
                 abbr_str = abbr.decode("utf-8", errors="ignore").strip()
@@ -150,19 +197,23 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
         if kernel32.VirtualQueryEx(
             h_process, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)
         ) == 0:
+            vq_fail += 1
             address += 0x10000
             continue
 
+        vq_ok += 1
         region_base = int(ctypes.cast(mbi.BaseAddress, ctypes.c_void_p).value or 0)
         region_size = int(mbi.RegionSize)
 
         if mbi.State == MEM_COMMIT and _is_readable_committed_region(mbi.Protect):
+            readable_regions += 1
             offset = 0
             while offset < region_size:
                 read_len = min(chunk_max, region_size - offset)
                 buffer = (ctypes.c_char * read_len)()
                 bytes_read = ctypes.c_size_t()
                 read_addr = region_base + offset
+                chunks_read += 1
 
                 if kernel32.ReadProcessMemory(
                     h_process,
@@ -171,8 +222,19 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
                     read_len,
                     ctypes.byref(bytes_read),
                 ):
+                    rpm_ok += 1
                     data = bytes(buffer[: bytes_read.value])
                     scan_buffer(data)
+                else:
+                    rpm_fail += 1
+                    if rpm_fail <= 8:
+                        err = kernel32.GetLastError()
+                        _log.debug(
+                            "ReadProcessMemory fail addr=0x%x len=%s err=%s",
+                            read_addr,
+                            read_len,
+                            err,
+                        )
 
                 if read_len < chunk_max:
                     offset += read_len
@@ -183,6 +245,32 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
         if next_address <= address:
             next_address = address + 0x1000
         address = next_address
+
+    elapsed = time.perf_counter() - t0
+    accepted = len(found_data)
+    _log.info(
+        "quick_scan done in %.2fs: VirtualQuery ok=%s fail=%s readable_regions=%s "
+        "chunks=%s rpm_ok=%s rpm_fail=%s raw_regex_hits=%s accepted_alliances=%s",
+        elapsed,
+        vq_ok,
+        vq_fail,
+        readable_regions,
+        chunks_read,
+        rpm_ok,
+        rpm_fail,
+        raw_pattern_hits,
+        accepted,
+    )
+    if accepted == 0 and raw_pattern_hits == 0:
+        _log.warning(
+            "No regex matches for alliance pattern — rankings data may be encoded differently "
+            "or this may not be the game process."
+        )
+    elif accepted == 0 and raw_pattern_hits > 0:
+        _log.warning(
+            "Had %s raw regex hits but 0 accepted rows (filters may be too strict).",
+            raw_pattern_hits,
+        )
 
     return found_data
 
@@ -238,11 +326,14 @@ def run_monitor_loop(
     while not should_stop():
         try:
             if not proc.is_running():
+                _log.warning("Process pid=%s no longer running; stopping monitor loop.", proc.pid)
                 break
         except psutil.NoSuchProcess:
+            _log.warning("Process disappeared; stopping monitor loop.")
             break
 
         scan_count += 1
+        _log.debug("monitor loop scan #%s starting", scan_count)
         new_data = quick_scan(h_process, kernel32)
         if alliances_lock:
             with alliances_lock:
