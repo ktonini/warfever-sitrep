@@ -114,6 +114,56 @@ def _is_readable_committed_region(protect: int) -> bool:
     )
 
 
+def _rpm_read_chunk(
+    kernel32: Any, h_process: Any, read_addr: int, read_len: int
+) -> tuple[bytes, bool]:
+    """
+    Read up to read_len bytes. Returns (data, used_paged_fallback).
+    Large reads often fail with ERROR_PARTIAL_COPY (299); 4 KiB stepping recovers most data.
+    """
+    if read_len <= 0:
+        return b"", False
+    buf = (ctypes.c_char * read_len)()
+    br = ctypes.c_size_t()
+    ok = kernel32.ReadProcessMemory(
+        h_process,
+        ctypes.c_void_p(read_addr),
+        buf,
+        read_len,
+        ctypes.byref(br),
+    )
+    if ok and int(br.value) == read_len:
+        return bytes(buf[:read_len]), False
+
+    err = kernel32.GetLastError()
+    page = 4096
+    out = bytearray()
+    pos = 0
+    while pos < read_len:
+        chunk = min(page, read_len - pos)
+        b2 = (ctypes.c_char * chunk)()
+        br2 = ctypes.c_size_t()
+        if kernel32.ReadProcessMemory(
+            h_process,
+            ctypes.c_void_p(read_addr + pos),
+            b2,
+            chunk,
+            ctypes.byref(br2),
+        ):
+            got = int(br2.value)
+            if got > 0:
+                out.extend(b2[:got])
+        pos += chunk
+    if not out:
+        _log.debug(
+            "RPM chunk empty after paged read addr=0x%x len=%s first_err=%s",
+            read_addr,
+            read_len,
+            err,
+        )
+    return bytes(out), True
+
+
 def quick_scan(
     h_process: Any,
     kernel32: Any,
@@ -147,10 +197,31 @@ def quick_scan(
     # In-memory rows often look like: GMUvvU 37ecf329... 2veni vidi vici8
     # (0–3 prefix bytes before tag; name may end with control or trailing '8').
     ALLIANCE_PATTERNS = (
-        rb".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
-        rb".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^8\x00]{3,50}?)8",
-        rb"([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-f]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+        rb".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+        rb".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^8\x00]{3,50}?)8",
+        rb"([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+        rb".{0,3}([A-Za-z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
     )
+
+    # Unity / IL2CPP often stores UI strings as UTF-16LE; same logical layout as ASCII patterns.
+    ALLIANCE_PATTERNS_U = (
+        r".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+        r".{0,3}([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^8\x00]{3,50}?)8",
+        r"([A-Z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+        r".{0,3}([A-Za-z][A-Za-z0-9]{1,6})\s+([0-9a-fA-F]{32})\s+\d([^\d\x00-\x08\x0b-\x1f]{3,40}?)\d?[\x00-\x08\x0b-\x1f]?",
+    )
+
+    def _likely_utf16le_text_blob(blob: bytes) -> bool:
+        """Cheap check for UTF-16LE Latin runs (Unity/C# string heaps)."""
+        if len(blob) < 64:
+            return False
+        n = min(len(blob) & ~1, 768)
+        hits = 0
+        for i in range(0, n, 2):
+            lo, hi = blob[i], blob[i + 1]
+            if hi == 0 and 32 <= lo <= 126:
+                hits += 1
+        return hits >= 12
 
     chunk_max = 2 * 1024 * 1024
     chunk_overlap = 16384
@@ -161,13 +232,51 @@ def quick_scan(
     chunks_read = 0
     rpm_ok = 0
     rpm_fail = 0
-    raw_pattern_hits = 0
+    rpm_paged_recoveries = 0
+    raw_byte_hits = 0
+    utf16_raw_hits = 0
+
+    def _store_row(
+        blob: bytes,
+        anchor: bytes,
+        abbr_str: str,
+        alliance_id_str: str,
+        full_name_str: str,
+    ) -> None:
+        if not (3 < len(full_name_str) < 50 and len(abbr_str) <= 10):
+            return
+        alliance_id_str = alliance_id_str.lower()
+        if len(alliance_id_str) != 32 or not re.fullmatch(r"[0-9a-f]+", alliance_id_str):
+            return
+        abbr_idx = blob.find(anchor)
+        rank = None
+        power = None
+        if abbr_idx != -1:
+            check_start = max(0, abbr_idx - 100)
+            check_end = min(len(blob), abbr_idx + 200)
+            check_region = blob[check_start:check_end]
+            for r in range(1, 51):
+                if struct.pack("<I", r) in check_region:
+                    rank = r
+                    break
+            for i in range(0, len(check_region) - 8, 4):
+                val = struct.unpack("<Q", check_region[i : i + 8])[0]
+                if 1_000_000_000 <= val <= 10_000_000_000:
+                    power = val
+                    break
+        found_data[alliance_id_str] = {
+            "abbr": abbr_str,
+            "name": full_name_str,
+            "id": alliance_id_str,
+            "rank": rank,
+            "power": power,
+        }
 
     def scan_buffer(data: bytes) -> None:
-        nonlocal raw_pattern_hits
+        nonlocal raw_byte_hits
         for pat in ALLIANCE_PATTERNS:
             matches = re.findall(pat, data)
-            raw_pattern_hits += len(matches)
+            raw_byte_hits += len(matches)
             for abbr, alliance_id, full_name in matches:
                 try:
                     abbr_str = abbr.decode("utf-8", errors="ignore").strip()
@@ -177,36 +286,33 @@ def quick_scan(
                         c for c in full_name_str if c.isprintable() or c.isspace()
                     )
                     full_name_str = " ".join(full_name_str.split())
+                    _store_row(data, abbr, abbr_str, alliance_id_str, full_name_str)
+                except (UnicodeDecodeError, struct.error, IndexError, TypeError):
+                    continue
 
-                    if 3 < len(full_name_str) < 50 and len(abbr_str) <= 10:
-                        abbr_idx = data.find(abbr)
-                        rank = None
-                        power = None
-
-                        if abbr_idx != -1:
-                            check_start = max(0, abbr_idx - 100)
-                            check_end = min(len(data), abbr_idx + 200)
-                            check_region = data[check_start:check_end]
-
-                            for r in range(1, 51):
-                                if struct.pack("<I", r) in check_region:
-                                    rank = r
-                                    break
-
-                            for i in range(0, len(check_region) - 8, 4):
-                                val = struct.unpack("<Q", check_region[i : i + 8])[0]
-                                if 1_000_000_000 <= val <= 10_000_000_000:
-                                    power = val
-                                    break
-
-                        found_data[alliance_id_str] = {
-                            "abbr": abbr_str,
-                            "name": full_name_str,
-                            "id": alliance_id_str,
-                            "rank": rank,
-                            "power": power,
-                        }
-                except (UnicodeDecodeError, struct.error, IndexError):
+    def scan_buffer_utf16(data: bytes) -> None:
+        nonlocal utf16_raw_hits
+        if len(data) < 64:
+            return
+        u = data.decode("utf-16-le", errors="ignore")
+        if len(u) < 40:
+            return
+        for pat in ALLIANCE_PATTERNS_U:
+            matches = re.findall(pat, u)
+            if not matches:
+                continue
+            utf16_raw_hits += len(matches)
+            for abbr_str, alliance_id_str, full_name_str in matches:
+                try:
+                    full_name_str = "".join(
+                        c for c in full_name_str if c.isprintable() or c.isspace()
+                    )
+                    full_name_str = " ".join(full_name_str.split())
+                    abbr_str = abbr_str.strip()
+                    alliance_id_str = alliance_id_str.strip()
+                    anchor = abbr_str.encode("utf-16-le")
+                    _store_row(data, anchor, abbr_str, alliance_id_str, full_name_str)
+                except (UnicodeDecodeError, struct.error, IndexError, TypeError):
                     continue
 
     while address < max_address:
@@ -233,31 +339,19 @@ def quick_scan(
                     aborted = True
                     break
                 read_len = min(chunk_max, region_size - offset)
-                buffer = (ctypes.c_char * read_len)()
-                bytes_read = ctypes.c_size_t()
                 read_addr = region_base + offset
                 chunks_read += 1
 
-                if kernel32.ReadProcessMemory(
-                    h_process,
-                    ctypes.c_void_p(read_addr),
-                    buffer,
-                    read_len,
-                    ctypes.byref(bytes_read),
-                ):
+                data, used_paged = _rpm_read_chunk(kernel32, h_process, read_addr, read_len)
+                if data:
                     rpm_ok += 1
-                    data = bytes(buffer[: bytes_read.value])
+                    if used_paged:
+                        rpm_paged_recoveries += 1
                     scan_buffer(data)
+                    if _likely_utf16le_text_blob(data):
+                        scan_buffer_utf16(data)
                 else:
                     rpm_fail += 1
-                    if rpm_fail <= 8:
-                        err = kernel32.GetLastError()
-                        _log.debug(
-                            "ReadProcessMemory fail addr=0x%x len=%s err=%s",
-                            read_addr,
-                            read_len,
-                            err,
-                        )
 
                 if read_len < chunk_max:
                     offset += read_len
@@ -274,9 +368,11 @@ def quick_scan(
 
     elapsed = time.perf_counter() - t0
     accepted = len(found_data)
+    pattern_hits = raw_byte_hits + utf16_raw_hits
     _log.info(
         "quick_scan %sin %.2fs: VirtualQuery ok=%s fail=%s readable_regions=%s "
-        "chunks=%s rpm_ok=%s rpm_fail=%s raw_regex_hits=%s accepted_alliances=%s",
+        "chunks=%s rpm_ok=%s rpm_fail=%s rpm_paged_recover=%s "
+        "raw_ascii_hits=%s utf16_hits=%s accepted_alliances=%s",
         "aborted " if aborted else "done ",
         elapsed,
         vq_ok,
@@ -285,18 +381,22 @@ def quick_scan(
         chunks_read,
         rpm_ok,
         rpm_fail,
-        raw_pattern_hits,
+        rpm_paged_recoveries,
+        raw_byte_hits,
+        utf16_raw_hits,
         accepted,
     )
-    if accepted == 0 and raw_pattern_hits == 0:
+    if accepted == 0 and pattern_hits == 0:
         _log.warning(
-            "No regex matches for alliance pattern — rankings data may be encoded differently "
-            "or this may not be the game process."
+            "No regex matches (ASCII or UTF-16) — rankings layout may have changed, "
+            "strings may be encrypted until render, or rankings UI is not in memory."
         )
-    elif accepted == 0 and raw_pattern_hits > 0:
+    elif accepted == 0 and pattern_hits > 0:
         _log.warning(
-            "Had %s raw regex hits but 0 accepted rows (filters may be too strict).",
-            raw_pattern_hits,
+            "Had %s pattern hits (ascii=%s utf16=%s) but 0 accepted rows (filters may be too strict).",
+            pattern_hits,
+            raw_byte_hits,
+            utf16_raw_hits,
         )
 
     return found_data
