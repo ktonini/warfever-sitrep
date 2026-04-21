@@ -1,0 +1,3 @@
+# Windows-only: live memory monitor + packaged GUI
+psutil>=5.9.0
+pyinstaller>=6.3.0
