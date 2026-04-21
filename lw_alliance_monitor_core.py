@@ -114,8 +114,17 @@ def _is_readable_committed_region(protect: int) -> bool:
     )
 
 
-def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
+def quick_scan(
+    h_process: Any,
+    kernel32: Any,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, dict[str, Any]]:
     t0 = time.perf_counter()
+
+    def _abort_requested() -> bool:
+        return should_stop is not None and should_stop()
+
+    aborted = False
     class MEMORY_BASIC_INFORMATION(ctypes.Structure):
         _fields_ = [
             ("BaseAddress", ctypes.c_void_p),
@@ -201,6 +210,10 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
                     continue
 
     while address < max_address:
+        if _abort_requested():
+            aborted = True
+            break
+
         if kernel32.VirtualQueryEx(
             h_process, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)
         ) == 0:
@@ -216,6 +229,9 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
             readable_regions += 1
             offset = 0
             while offset < region_size:
+                if _abort_requested():
+                    aborted = True
+                    break
                 read_len = min(chunk_max, region_size - offset)
                 buffer = (ctypes.c_char * read_len)()
                 bytes_read = ctypes.c_size_t()
@@ -248,6 +264,9 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
                 else:
                     offset += chunk_max - chunk_overlap
 
+            if aborted:
+                break
+
         next_address = region_base + region_size
         if next_address <= address:
             next_address = address + 0x1000
@@ -256,8 +275,9 @@ def quick_scan(h_process: Any, kernel32: Any) -> dict[str, dict[str, Any]]:
     elapsed = time.perf_counter() - t0
     accepted = len(found_data)
     _log.info(
-        "quick_scan done in %.2fs: VirtualQuery ok=%s fail=%s readable_regions=%s "
+        "quick_scan %sin %.2fs: VirtualQuery ok=%s fail=%s readable_regions=%s "
         "chunks=%s rpm_ok=%s rpm_fail=%s raw_regex_hits=%s accepted_alliances=%s",
+        "aborted " if aborted else "done ",
         elapsed,
         vq_ok,
         vq_fail,
@@ -341,7 +361,7 @@ def run_monitor_loop(
 
         scan_count += 1
         _log.debug("monitor loop scan #%s starting", scan_count)
-        new_data = quick_scan(h_process, kernel32)
+        new_data = quick_scan(h_process, kernel32, should_stop)
         if alliances_lock:
             with alliances_lock:
                 merge_alliances(all_alliances, new_data)
@@ -351,4 +371,6 @@ def run_monitor_loop(
             total = len(all_alliances)
         if on_scan_complete:
             on_scan_complete(scan_count, total)
+        if should_stop():
+            break
         time.sleep(scan_interval_sec)

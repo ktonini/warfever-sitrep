@@ -107,6 +107,8 @@ class AllianceMonitorApp(tk.Tk):
         self._debug_log_path = application_base_dir() / "lw_monitor_debug.log"
         self._verbose_var = tk.BooleanVar(value=True)
         self._tk_log_handler: _TkTextLogHandler | None = None
+        self._scan_once_thread: threading.Thread | None = None
+        self._scan_once_busy = False
 
         self._build_ui()
 
@@ -228,11 +230,23 @@ class AllianceMonitorApp(tk.Tk):
             self._path_var.set(path)
 
     def _set_running_ui(self, running: bool) -> None:
-        self._start_btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+        busy = bool(getattr(self, "_scan_once_busy", False))
+        self._start_btn.configure(state=tk.DISABLED if (running or busy) else tk.NORMAL)
         self._stop_btn.configure(state=tk.NORMAL if running else tk.DISABLED)
-        self._scan_once_btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self._scan_once_btn.configure(state=tk.DISABLED if (running or busy) else tk.NORMAL)
+
+    def _set_scan_once_busy(self, busy: bool) -> None:
+        self._scan_once_busy = busy
+        monitoring = self._worker is not None and self._worker.is_alive()
+        self._scan_once_btn.configure(state=tk.DISABLED if (monitoring or busy) else tk.NORMAL)
+        self._start_btn.configure(state=tk.DISABLED if (monitoring or busy) else tk.NORMAL)
 
     def _on_start(self) -> None:
+        if self._scan_once_busy or (
+            self._scan_once_thread is not None and self._scan_once_thread.is_alive()
+        ):
+            messagebox.showinfo("Please wait", "A background memory scan is still running.")
+            return
         self._output_path = Path(self._path_var.get()).expanduser()
         get_logger().info("Start monitoring clicked")
         game_proc = find_process("LastWar")
@@ -320,11 +334,19 @@ class AllianceMonitorApp(tk.Tk):
 
     def _on_stop(self) -> None:
         self._stop_event.set()
-        self._status_var.set("Stopping…")
+        self._status_var.set(
+            "Stopping… (current memory pass exits at the next safe check; usually a few seconds)"
+        )
 
     def _on_scan_once(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            messagebox.showinfo("Monitoring active", "Stop monitoring before running Scan once.")
+            return
+        if self._scan_once_thread is not None and self._scan_once_thread.is_alive():
+            return
+
         self._output_path = Path(self._path_var.get()).expanduser()
-        get_logger().info("Scan once clicked")
+        get_logger().info("Scan once clicked (background thread)")
         game_proc = find_process("LastWar")
         if not game_proc:
             messagebox.showerror("Game not found", "Start the game first.")
@@ -333,22 +355,45 @@ class AllianceMonitorApp(tk.Tk):
         if not opened:
             messagebox.showerror("Access denied", "Could not open the process. Try Run as administrator.")
             return
-        h, k32 = opened
-        self._status_var.set("Scanning memory once…")
-        self.update_idletasks()
-        try:
-            new_data = quick_scan(h, k32)
-            with self._alliances_lock:
-                merge_alliances(self._alliances, new_data)
-            get_logger().info(
-                "Scan once finished; new_keys=%s total_alliances=%s",
-                len(new_data),
-                len(self._alliances),
-            )
-        finally:
-            close_handle(k32, h)
-        self._refresh_table()
-        self._status_var.set(f"Single scan done — {len(self._alliances)} unique alliances in table.")
+        h_proc, k32 = opened
+
+        self._set_scan_once_busy(True)
+        self._status_var.set("Scan once running in background (UI should stay responsive)…")
+
+        def run_once() -> None:
+            err: BaseException | None = None
+            new_data: dict[str, Any] = {}
+            try:
+                new_data = quick_scan(h_proc, k32, lambda: self._shutting_down)
+            except Exception as e:
+                err = e
+                get_logger().exception("Scan once failed")
+            finally:
+                close_handle(k32, h_proc)
+
+            def ui_done() -> None:
+                self._scan_once_thread = None
+                self._set_scan_once_busy(False)
+                if err is not None:
+                    messagebox.showerror("Scan failed", str(err))
+                    self._status_var.set("Scan once failed.")
+                    return
+                with self._alliances_lock:
+                    merge_alliances(self._alliances, new_data)
+                self._refresh_table()
+                get_logger().info(
+                    "Scan once finished; new_keys=%s total_alliances=%s",
+                    len(new_data),
+                    len(self._alliances),
+                )
+                self._status_var.set(
+                    f"Single scan done — {len(self._alliances)} unique alliances in table."
+                )
+
+            self.after(0, ui_done)
+
+        self._scan_once_thread = threading.Thread(target=run_once, daemon=True)
+        self._scan_once_thread.start()
 
     def _save_csv(self, show_confirm: bool) -> None:
         self._output_path = Path(self._path_var.get()).expanduser()
@@ -399,6 +444,8 @@ class AllianceMonitorApp(tk.Tk):
     def destroy(self) -> None:
         self._shutting_down = True
         self._stop_event.set()
+        if self._scan_once_thread and self._scan_once_thread.is_alive():
+            self._scan_once_thread.join(timeout=30.0)
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=12.0)
         if self._finalize_after_id is not None:
